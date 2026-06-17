@@ -71,30 +71,73 @@ function encodeB64(str) { return Buffer.from(str).toString('base64url'); }
 function decodeB64(b64) { return Buffer.from(b64, 'base64url').toString('utf8'); }
 
 /**
- * HLS Proxy — bypasses the need for client-side proxyHeaders.
+ * HLS Proxy with auto-refreshing CDN tokens.
  *
- * The player (Stremio/Nuvio/AIOStreams) only sees URLs on our own server.
- * Our server fetches the real m3u8 and segments from the VidXgo CDN with
- * the correct Referer/Origin headers, so every client works without freeze.
+ * VidXgo m3u8 URLs carry a token (?t=...&e=...) that expires after ~2 minutes.
+ * The player (Stremio/Nuvio) fetches the m3u8 once and reuses segment URLs for
+ * the entire playback, which breaks when the token expires → 403 → freeze.
  *
- *   /proxy/hls/<base64url>  → fetches m3u8, rewrites internal URLs, returns text
- *   /proxy/seg/<base64url>  → fetches a segment/key, returns raw bytes
+ * This proxy solves it by:
+ * 1. Caching the VidXgo resolution per IMDb ID
+ * 2. Auto-refreshing the token every TOKEN_TTL_MS (60 seconds)
+ * 3. Encoding only the RELATIVE path in proxy URLs (token appended at fetch time)
+ *
+ * Routes:
+ *   /proxy/video/:imdbId         → fetches master m3u8, rewrites URLs, returns text
+ *   /proxy/ts/:imdbId/:pathB64   → fetches sub-playlist or segment, returns raw/text
  */
 
-// Rewrite all URLs inside an m3u8 playlist to point through /proxy/seg or /proxy/hls
-function rewriteM3u8(text, baseUrl) {
+// VidXgo resolution cache: maps imdbId → { baseUrl, tokenParams, type, season, episode, expiresAt }
+const streamCache = new Map();
+const TOKEN_TTL_MS = 60 * 1000; // refresh token every 60 seconds
+
+async function getFreshToken(imdbId, type, season, episode) {
+    const cached = streamCache.get(imdbId);
+    if (cached && Date.now() < cached.expiresAt) {
+        return cached;
+    }
+
+    console.log(`[Proxy] Refreshing VidXgo token for ${imdbId}${season ? ` S${season}E${episode}` : ''}`);
+    const result = await scraper.resolveStream(imdbId, type, season, episode);
+
+    if (!result.m3u8) {
+        if (cached) return cached; // keep serving stale cache if re-resolve fails
+        throw new Error('No m3u8 URL from VidXgo');
+    }
+
+    const url = new URL(result.m3u8);
+    const fresh = {
+        baseUrl: url.origin,           // e.g. https://media-498.d2b.you:8443
+        tokenParams: url.search,        // e.g. ?t=xxx&e=yyy&b=zzz
+        m3u8Url: result.m3u8,          // full m3u8 URL for path extraction
+        type, season, episode,
+        expiresAt: Date.now() + TOKEN_TTL_MS,
+    };
+    streamCache.set(imdbId, fresh);
+    return fresh;
+}
+
+// Build a full CDN URL from a cached token + relative path
+function buildCdnUrl(token, path) {
+    return token.baseUrl + path + token.tokenParams;
+}
+
+// Rewrite all URLs inside an m3u8 playlist to point through our proxy.
+// Extracts the RELATIVE path (without token params) and encodes it alongside
+// the IMDb ID so the proxy handler can reconstruct the full URL with a fresh token.
+function rewriteM3u8(text, baseUrl, imdbId) {
     const base = new URL(baseUrl);
     return text.split('\n').map(line => {
         const trimmed = line.trim();
         if (!trimmed) return line;
 
-        // Rewrite URI="..." attributes inside #EXT-X-KEY, #EXT-X-MAP, etc.
+        // Rewrite URI="..." attributes inside #EXT-X-KEY, #EXT-X-MAP, #EXT-X-I-FRAME-STREAM-INF, etc.
         if (trimmed.startsWith('#') && trimmed.includes('URI="')) {
             return line.replace(/URI="([^"]+)"/g, (match, rawUri) => {
                 try {
-                    const abs = new URL(rawUri, base).toString();
-                    const route = abs.includes('.m3u8') ? 'hls' : 'seg';
-                    return `URI="${SELF_URL}/proxy/${route}/${encodeB64(abs)}"`;
+                    const abs = new URL(rawUri, base);
+                    const path = abs.pathname + abs.search;
+                    return `URI="${SELF_URL}/proxy/ts/${imdbId}/${encodeB64(path)}"`;
                 } catch { return match; }
             });
         }
@@ -104,31 +147,47 @@ function rewriteM3u8(text, baseUrl) {
 
         // Non-comment line: treat as a segment or sub-playlist URL
         try {
-            const abs = new URL(trimmed, base).toString();
-            const route = abs.includes('.m3u8') ? 'hls' : 'seg';
-            return `${SELF_URL}/proxy/${route}/${encodeB64(abs)}`;
+            const abs = new URL(trimmed, base);
+            const path = abs.pathname + abs.search;
+            return `${SELF_URL}/proxy/ts/${imdbId}/${encodeB64(path)}`;
         } catch { return line; }
     }).join('\n');
 }
 
-async function handleHls(req, res, parsedUrl) {
-    const b64 = parsedUrl.pathname.replace('/proxy/hls/', '');
-    let targetUrl;
-    try { targetUrl = decodeB64(b64); } catch {
+// /proxy/video/:imdbId — fetch master m3u8 with fresh token, rewrite, return
+async function handleVideo(req, res, parsedUrl) {
+    const imdbId = parsedUrl.pathname.replace('/proxy/video/', '');
+    if (!imdbId || !imdbId.startsWith('tt')) {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
-        return res.end('Invalid base64');
+        return res.end('Missing or invalid IMDb ID');
     }
 
     try {
-        const response = await fetch(targetUrl, { headers: VIDXGO_HEADERS, timeout: 15000, follow: 5 });
+        const cached = streamCache.get(imdbId);
+        const token = await getFreshToken(imdbId,
+            cached?.type || 'movie',
+            cached?.season || null,
+            cached?.episode || null);
+
+        // Reconstruct the master m3u8 URL with the fresh token
+        const freshCache = streamCache.get(imdbId);
+        let masterUrl;
+        if (freshCache?.m3u8Url) {
+            const orig = new URL(freshCache.m3u8Url);
+            masterUrl = token.baseUrl + orig.pathname + token.tokenParams;
+        } else {
+            masterUrl = token.baseUrl + '/proxy/media-836/hls/' + imdbId.replace('tt', '') + '/master.m3u8' + token.tokenParams;
+        }
+
+        const response = await fetch(masterUrl, { headers: VIDXGO_HEADERS, timeout: 15000, follow: 5 });
         if (!response.ok) {
-            console.error(`[Proxy HLS] upstream ${response.status} for ${targetUrl.slice(0, 80)}`);
+            console.error(`[Proxy Video] upstream ${response.status} for ${imdbId}`);
             res.writeHead(response.status, { 'Content-Type': 'text/plain' });
             return res.end(`Upstream error: ${response.status}`);
         }
 
         const text = await response.text();
-        const rewritten = rewriteM3u8(text, targetUrl);
+        const rewritten = rewriteM3u8(text, masterUrl, imdbId);
 
         res.writeHead(200, {
             'Content-Type': 'application/vnd.apple.mpegurl',
@@ -137,39 +196,68 @@ async function handleHls(req, res, parsedUrl) {
         });
         res.end(rewritten);
     } catch (e) {
-        console.error('[Proxy HLS] error:', e.message);
+        console.error('[Proxy Video] error:', e.message);
         res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Proxy error: ' + e.message);
     }
 }
 
-async function handleSeg(req, res, parsedUrl) {
-    const b64 = parsedUrl.pathname.replace('/proxy/seg/', '');
-    let targetUrl;
-    try { targetUrl = decodeB64(b64); } catch {
+// /proxy/ts/:imdbId/:pathB64 — fetch a sub-playlist or segment with fresh token
+async function handleTs(req, res, parsedUrl) {
+    const parts = parsedUrl.pathname.replace('/proxy/ts/', '').split('/');
+    const imdbId = parts[0];
+    const pathB64 = parts.slice(1).join('/');
+
+    if (!imdbId || !pathB64) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        return res.end('Missing parameters');
+    }
+
+    let path;
+    try { path = decodeB64(pathB64); } catch {
         res.writeHead(400, { 'Content-Type': 'text/plain' });
         return res.end('Invalid base64');
     }
 
     try {
-        const response = await fetch(targetUrl, { headers: VIDXGO_HEADERS, timeout: 30000, follow: 5 });
+        const cached = streamCache.get(imdbId);
+        const token = await getFreshToken(imdbId,
+            cached?.type || 'movie',
+            cached?.season || null,
+            cached?.episode || null);
+
+        const fullUrl = buildCdnUrl(token, path);
+
+        const response = await fetch(fullUrl, { headers: VIDXGO_HEADERS, timeout: 30000, follow: 5 });
         if (!response.ok) {
-            console.error(`[Proxy Seg] upstream ${response.status} for ${targetUrl.slice(0, 80)}`);
+            console.error(`[Proxy TS] upstream ${response.status} for ${imdbId} path=${path.slice(0, 50)}`);
             res.writeHead(response.status, { 'Content-Type': 'text/plain' });
             return res.end(`Upstream error: ${response.status}`);
         }
 
         const contentType = response.headers.get('Content-Type') || 'video/mp2t';
         const buffer = await response.buffer();
+        const isManifest = contentType.includes('mpegurl') || contentType.includes('vnd.apple');
 
-        res.writeHead(200, {
-            'Content-Type': contentType,
-            'Access-Control-Allow-Origin': '*',
-            'Cache-Control': 'public, max-age=3600',
-        });
-        res.end(buffer);
+        if (isManifest) {
+            const text = buffer.toString('utf8');
+            const rewritten = rewriteM3u8(text, fullUrl, imdbId);
+            res.writeHead(200, {
+                'Content-Type': 'application/vnd.apple.mpegurl',
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'no-cache',
+            });
+            res.end(rewritten);
+        } else {
+            res.writeHead(200, {
+                'Content-Type': contentType,
+                'Access-Control-Allow-Origin': '*',
+                'Cache-Control': 'public, max-age=3600',
+            });
+            res.end(buffer);
+        }
     } catch (e) {
-        console.error('[Proxy Seg] error:', e.message);
+        console.error('[Proxy TS] error:', e.message);
         res.writeHead(502, { 'Content-Type': 'text/plain' });
         res.end('Proxy error: ' + e.message);
     }
@@ -256,11 +344,22 @@ builder.defineStreamHandler(async ({ type, id }) => {
         if (result.m3u8) {
             const titleSuffix = (type === 'series' && season && episode) 
                 ? ` S${season}E${episode}` : '';
-            
-            // Wrap the m3u8 through our HLS proxy so the player never talks
-            // directly to the VidXgo CDN (which requires Referer/Origin headers
-            // that some clients like Nuvio don't send on segment requests).
-            const proxyUrl = `${SELF_URL}/proxy/hls/${encodeB64(result.m3u8)}`;
+
+            // Cache the VidXgo resolution so the proxy can auto-refresh the token
+            // every TOKEN_TTL_MS (60s) before the CDN token expires (~2 min).
+            try {
+                const url = new URL(result.m3u8);
+                streamCache.set(imdbId, {
+                    baseUrl: url.origin,
+                    tokenParams: url.search,
+                    m3u8Url: result.m3u8,
+                    type, season, episode,
+                    expiresAt: Date.now() + TOKEN_TTL_MS,
+                });
+            } catch {}
+
+            // Player sees only our own server — proxy handles CDN auth + token refresh
+            const proxyUrl = `${SELF_URL}/proxy/video/${imdbId}`;
             const stream = {
                 title: `StreamingCommunity ITA 🇮🇹${titleSuffix}`,
                 url: proxyUrl,
@@ -300,11 +399,11 @@ async function start() {
             const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
 
             // HLS proxy routes — intercepted before the SDK router
-            if (parsedUrl.pathname.startsWith('/proxy/hls/')) {
-                return handleHls(req, res, parsedUrl);
+            if (parsedUrl.pathname.startsWith('/proxy/video/')) {
+                return handleVideo(req, res, parsedUrl);
             }
-            if (parsedUrl.pathname.startsWith('/proxy/seg/')) {
-                return handleSeg(req, res, parsedUrl);
+            if (parsedUrl.pathname.startsWith('/proxy/ts/')) {
+                return handleTs(req, res, parsedUrl);
             }
 
             // Landing page
@@ -327,10 +426,11 @@ async function start() {
             console.log('  StreamingCommunity Stremio Add-on v3.0');
             console.log('  HLS Proxy + VidXgo XOR decryption - NO Puppeteer!');
             console.log('='.repeat(60));
-            console.log(`  Manifest:  ${localUrl}/manifest.json`);
-            console.log(`  Self URL:   ${SELF_URL}`);
-            console.log(`  HLS proxy:  ${SELF_URL}/proxy/hls/<b64>`);
-            console.log(`  Seg proxy:  ${SELF_URL}/proxy/seg/<b64>`);
+            console.log(`  Manifest:    ${localUrl}/manifest.json`);
+            console.log(`  Self URL:     ${SELF_URL}`);
+            console.log(`  Video proxy:  ${SELF_URL}/proxy/video/:imdbId`);
+            console.log(`  TS proxy:     ${SELF_URL}/proxy/ts/:imdbId/:path`);
+            console.log(`  Token TTL:    ${TOKEN_TTL_MS}ms (auto-refresh)`);
             console.log(`  Stream delay: ${STREAM_DELAY_MS}ms ${STREAM_DELAY_MS > 0 ? '(debrid priority)' : '(disabled)'}`);
             console.log('='.repeat(60));
             console.log('');
