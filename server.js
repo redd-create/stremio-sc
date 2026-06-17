@@ -129,7 +129,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
                 title: `StreamingCommunity ITA 🇮🇹${titleSuffix}`,
                 url: result.m3u8,
                 behaviorHints: {
-                    notWebReady: true,
                     bingeGroup: `sc-${imdbId}`,
                     proxyHeaders: result.playbackHeaders ? { request: result.playbackHeaders } : undefined,
                 },
