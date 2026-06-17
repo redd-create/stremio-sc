@@ -1,0 +1,15 @@
+{
+  "name": "stremio-streaming-community",
+  "version": "3.0.0",
+  "description": "Stremio addon per StreamingCommunity - Film e Serie TV in streaming ITA con m3u8 diretto",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "type": "commonjs",
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "node-fetch": "^2.7.0",
+    "stremio-addon-sdk": "^1.6.10"
+  }
+}
