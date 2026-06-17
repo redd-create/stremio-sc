@@ -4,6 +4,13 @@ const fetch = require('node-fetch');
 const BASE_URL = 'https://streaming-community.watch';
 const VIDXGO_DOMAIN = 'https://v.vidxgo.co';
 
+// Optional reverse proxy (Cloudflare Worker) to bypass IP blocks on
+// streaming-community.watch from datacenter hosts (e.g. Render).
+// When set, fetchPage routes BASE_URL requests through this proxy.
+// VidXgo requests are always direct (they work fine from datacenters).
+// Example: https://sc-proxy.xxx.workers.dev/?url=
+const PROXY_URL = process.env.PROXY_URL || '';
+
 // Simple in-memory cache with TTL
 const cache = new Map();
 const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
@@ -36,7 +43,13 @@ async function fetchPage(url, retries = 3) {
 
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const response = await fetch(url, {
+            // Route through PROXY_URL when targeting BASE_URL (streaming-community.watch)
+            // to bypass datacenter IP blocks. Cache key stays on the original url.
+            const fetchUrl = (PROXY_URL && url.startsWith(BASE_URL))
+                ? `${PROXY_URL}${encodeURIComponent(url)}`
+                : url;
+
+            const response = await fetch(fetchUrl, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:150.0) Gecko/20100101 Firefox/150.0',
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
